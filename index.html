@@ -67,7 +67,7 @@
             background-color: #fff;
             transition: border-color 0.3s;
             box-sizing: border-box;
-            appearance: none; /* למראה נקי בנייד */
+            appearance: none;
         }
 
         select:focus, textarea:focus { border-color: var(--primary); }
@@ -302,17 +302,23 @@
         let storyPages = [];
         let currentPage = 0;
 
-        async function fetchWithRetry(url, options, retries = 3, backoff = 1500) {
+        // פונקציה משופרת לטיפול בקריאות API עם לוגים לשגיאות
+        async function fetchWithRetry(url, options, retries = 3, backoff = 1000) {
             for (let i = 0; i < retries; i++) {
                 try {
                     const res = await fetch(url, options);
                     if (res.ok) return res;
-                    if (res.status === 429) { // Too many requests
+                    
+                    const errorData = await res.json().catch(() => ({}));
+                    console.error(`Attempt ${i+1} failed:`, errorData);
+                    
+                    if (res.status === 429) {
                          await new Promise(r => setTimeout(r, backoff * Math.pow(2, i)));
                          continue;
                     }
-                    throw new Error(`Server returned ${res.status}`);
+                    throw new Error(`Server returned ${res.status}: ${JSON.stringify(errorData)}`);
                 } catch (err) {
+                    console.warn(`Retry ${i+1} due to error:`, err);
                     if (i === retries - 1) throw err;
                     await new Promise(r => setTimeout(r, backoff * Math.pow(2, i)));
                 }
@@ -331,36 +337,49 @@
             document.getElementById('loading-screen').style.display = 'block';
 
             const systemPrompt = `You are a Hebrew story writer. Output a JSON object ONLY.
-            The story must have 10 pages. Each page has 'text' (Hebrew paragraph) and 'imagePrompt' (English description).
-            Format: {"title": "...", "pages": [{"text": "...", "imagePrompt": "..."}]}`;
+            The story must have 10 pages. Each page has 'text' (Hebrew paragraph) and 'imagePrompt' (English description for an illustration).
+            JSON Structure: {"title": "Story Title", "pages": [{"text": "...", "imagePrompt": "..."}]}`;
 
-            const userQuery = `Write a ${gen} story about ${char} in ${loc}. ${idea ? 'User idea: ' + idea : ''}. 10 pages.`;
+            const userQuery = `Genre: ${gen}, Hero: ${char}, Place: ${loc}. ${idea ? 'Context: ' + idea : ''}. Make it 10 pages.`;
 
             try {
+                // שימוש במודל יציב יותר ותיקון מבנה השאילתה
                 const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         contents: [{ parts: [{ text: userQuery }] }],
                         systemInstruction: { parts: [{ text: systemPrompt }] },
-                        generationConfig: { responseMimeType: "application/json" }
+                        generationConfig: { 
+                            responseMimeType: "application/json",
+                            temperature: 0.7 
+                        }
                     })
                 });
 
-                if (!response.ok) throw new Error("API Connection Failed");
+                if (!response.ok) {
+                    const errTxt = await response.text();
+                    throw new Error(`API_ERROR: ${response.status}`);
+                }
 
                 const data = await response.json();
-                const resultText = data.candidates[0].content.parts[0].text;
+                
+                // חילוץ בטוח של הטקסט
+                let resultText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+                if (!resultText) throw new Error("EMPTY_RESPONSE");
+                
                 const storyData = JSON.parse(resultText);
                 
+                if (!storyData.pages || storyData.pages.length === 0) throw new Error("INVALID_STORY_FORMAT");
+
                 storyPages = storyData.pages;
-                document.getElementById('story-title').textContent = storyData.title;
+                document.getElementById('story-title').textContent = storyData.title || "סיפור חדש";
                 
                 showStory();
-                preloadAllImages(); // טעינה ברקע
+                preloadAllImages(); 
             } catch (error) {
-                console.error(error);
-                errorDiv.textContent = "שגיאת תקשורת. וודא שיש חיבור אינטרנט יציב ונסה שוב.";
+                console.error("Full Generation Error:", error);
+                errorDiv.textContent = `חלה שגיאה ביצירת הסיפור. וודא שחיבור האינטרנט תקין ונסה שוב. (קוד: ${error.message.substring(0, 20)})`;
                 errorDiv.style.display = 'block';
                 document.getElementById('setup-screen').style.display = 'block';
                 document.getElementById('loading-screen').style.display = 'none';
@@ -368,15 +387,17 @@
         }
 
         async function preloadAllImages() {
-            // טעינה מדורגת כדי לא להעמיס על המעבד של הטלפון
+            // טעינה מדורגת - מתחילים מהעמוד הראשון
             for (let i = 0; i < storyPages.length; i++) {
                 if (storyPages[i].imageUrl) continue;
                 try {
                     const imgUrl = await requestImage(storyPages[i].imagePrompt);
                     storyPages[i].imageUrl = imgUrl;
                     if (i === currentPage) updatePageDisplay();
+                    // השהייה קלה בין בקשות תמונות כדי למנוע עומס
+                    await new Promise(r => setTimeout(r, 500));
                 } catch (e) {
-                    console.warn(`Image ${i} failed`);
+                    console.warn(`Image ${i} failed to load`);
                 }
             }
         }
@@ -387,12 +408,15 @@
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    instances: { prompt: prompt + " colorful digital art illustration" },
+                    instances: { prompt: prompt + ", beautiful storybook digital art illustration, vibrant colors" },
                     parameters: { sampleCount: 1 }
                 })
             });
             const data = await response.json();
-            return `data:image/png;base64,${data.predictions[0].bytesBase64Encoded}`;
+            if (data.predictions && data.predictions[0]) {
+                return `data:image/png;base64,${data.predictions[0].bytesBase64Encoded}`;
+            }
+            throw new Error("IMAGE_GEN_FAILED");
         }
 
         function showStory() {
@@ -403,6 +427,8 @@
 
         function updatePageDisplay() {
             const page = storyPages[currentPage];
+            if (!page) return;
+
             const contentEl = document.getElementById('page-content');
             const imgEl = document.getElementById('page-image');
             const loader = document.getElementById('img-loader');
@@ -426,9 +452,11 @@
         }
 
         function changePage(delta) {
-            currentPage += delta;
-            updatePageDisplay();
-            window.scrollTo({top: 0, behavior: 'smooth'});
+            if (storyPages[currentPage + delta]) {
+                currentPage += delta;
+                updatePageDisplay();
+                window.scrollTo({top: 0, behavior: 'smooth'});
+            }
         }
     </script>
 </body>
